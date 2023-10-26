@@ -1,0 +1,1669 @@
+
+## CRISP-DM
+## Business Understanding
+
+The Business Fundamentally needs a model that accurately determines which customers should be targeted with what type of email to maximize profitability. 
+
+For achieving this, we built two sub- models, one of which predicts whether a customer will visit the shop or not in 3 of the scenarios, 1) when the customer is sent men’s email, 2) the customer is sent women’s email, and 3) no email is sent. The other model that we built estimates how much the customer will spend, if he/she visits the shop. 
+
+We use these two models to select the scenario which maximizes the profit from that customer. To begin with, the first model predicts the scenario(s) wherein the customer will visit the shop. Those scenarios for which the model predicts that the customer will visit, are passed as inputs for the second model, which estimates the spending for all of them. The scenario wherein the profit (i.e. estimated spending from the customer – cost of sending email, if applicable) is the highest among all of the scenarios, is selected for that customer.
+
+For this project, we will need the following libraries.
+
+
+### Importing Packages
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+library(caTools) # for data partitioning
+library(randomForest)
+library(caret)
+library(pROC)
+library(party)
+library(FSelector)
+library(ROSE)
+library(tree)
+library(e1071)
+library(CustomerScoringMetrics)
+```
+## Data Understanding
+
+### Reading the data and checking its summary
+
+
+```{r message= FALSE, warning=FALSE }
+
+#reading dataset and storing it with the name 'data'
+data <- read_csv("assignment_data.csv")
+
+summary(data)
+
+```
+
+### Checking whether there is any spend when there is no visit
+
+```{r}
+#checking number of rows with visit = 0 and spend > 0
+print(nrow(filter(data, visit == 0, spend != 0)))
+
+#checking number of rows with visit = 1 and spend = 0
+print(nrow(filter(data, visit == 1, spend == 0)))
+
+#checking number of rows with visit = 1 and spend > 0
+print(nrow(filter(data, visit == 1, spend != 0)))
+```
+
+With the above code, we can conclude that there were no records where the visit was 0 and the spending was positive. This means that spending can only happen if there is a visit. This shows us that further when the model for predicting spend will be created, the model will only be trained and tested for evaluation in the data set filtered with only those customers who visited the shop. 
+
+## visualizing the distribution of spend data where the customer visited the store
+```{r warning = FALSE}
+subset_data <- filter(data, visit == 1)
+ggplot(subset_data) + geom_histogram(aes(subset_data$spend), binwidth = 10 )
+
+
+```
+
+we can see from the above graph that there seems to be outliers in the data. 
+lets check how many outliers we have. These will be treated with the appropriate method in the data preparation stage.
+
+## Checking proportion of outliers in the spend column.
+```{r}
+
+#vector of spend values where visit was equal to 1
+subset<- subset_data$spend
+
+
+#Q1 value in the vector
+q1 <- quantile(subset, 0.25, na.rm = TRUE)
+
+#Q3 value in the vector
+q3 <- quantile(subset, 0.75, na.rm = TRUE)
+
+#proportion of number of upper bound outlier values in the vector
+length(subset[replace_na(subset >= q3 + 1.5*(q3-q1), FALSE)])/length(subset[!is.na(subset)])
+```
+
+#### Checking proportion of lower bound outlier values in spend
+```{r}
+#proportion of number of lower bound outlier values in the vector
+length(subset[replace_na(subset <= q1 - 1.5*(q3-q1), FALSE)])/length(subset[!is.na(subset)])
+```
+
+since there are 0% low bound outlier data, we only have to treat upper bound outlier values in spend.
+
+## Plotting distribution of purchase column.
+```{r}
+ggplot(data) + geom_histogram(aes(data$purchase), binwidth = 10 )
+
+```
+As we can see from the above graph, it is not a normal distribution and has outliers. This should be treated appropriately in the data preparation stage.
+
+## checking proportion 1s and 0s in visit column
+```{r}
+prop.table(table(data$visit))
+
+
+```
+
+As we can see, the ratio of 0s and 1s in the visit column are not equal in proportion. Oversampling data balancing method will be used, rather than undersampling or combination of both oversampling and undersampling, as it is important that we retain all the original information in the data we have.
+
+## Data Preparation
+
+### converting the columns of categorical nature to factor data type
+```{r}
+#Converting columns of character data type to factor
+
+data[sapply(data, is.character)] <- lapply(data[sapply(data, is.character)], as.factor)
+
+
+#Converting selected categorical columns with numeric data type  to factor
+
+column_names <- c("recency", "mens", "womens", "new_customer", "dependent", "employed", "phone", "delivery", "marriage", "payment_card", "visit")
+
+data[column_names] <- lapply(data[column_names], as.factor)
+
+#displaying summary
+summary(data)
+
+```
+
+
+
+### Correct the NA values in purchase segment
+```{r}
+
+#replace  0-100 na values
+                                                            
+data[data$purchase < 100 & data$purchase >= 0 & is.na(data$purchase_segment),"purchase_segment"] <- "1) 0 - 100"
+
+#replacing 100-200 na values
+data[data$purchase < 200 & data$purchase >= 100 & is.na(data$purchase_segment),"purchase_segment"] <- "2) 100 - 200"
+
+
+#replace 200 - 350 na values
+data[data$purchase < 350 & data$purchase >= 200 & is.na(data$purchase_segment),"purchase_segment"] <- "3) 200 - 350"
+
+#replace 350 - 500 na values
+data[data$purchase < 500 & data$purchase >= 350 & is.na(data$purchase_segment),"purchase_segment"] <- "4) 350 - 500"
+
+#replace 500 - 750 na values
+data[data$purchase < 750 & data$purchase >= 500 & is.na(data$purchase_segment),"purchase_segment"] <- "5) 500 - 750"
+
+#replace 750 - 1000 na values
+data[data$purchase < 1000 & data$purchase >= 750 & is.na(data$purchase_segment), "purchase_segment"] <- "6) 750 - 1,000"
+
+
+#replace 1000 + na values
+data[data$purchase >= 1000 & is.na(data$purchase_segment),"purchase_segment"] <- "7) 1,000 +"
+
+```
+
+
+
+## Replacing outliers with the upper bound value
+```{r}
+#imputing the values above the upper bound with the upper bound value in the original dataset
+
+
+uoutlier_filter <- replace_na(data$spend >= q3 + 1.5*(q3-q1), FALSE)
+
+data[data$visit == 1 & uoutlier_filter, ]$spend <- q3 + 1.5*(q3-q1)
+
+
+#checking the proportion again of upper bound outlier value in the vector
+length(data$spend[replace_na(data$spend > q3 + 1.5*(q3-q1),FALSE)])/length(subset[!is.na(subset)])
+```
+
+ 
+
+
+### Visualizing spend data after replacing outlier values with corrected values
+```{r}
+#visualizing the spend data after imputation of outlier values
+ggplot(data[data$visit == 1,]) + geom_histogram(aes(data[data$visit == 1,]$spend), binwidth = 10 )
+
+```
+
+
+
+
+## Creating Visit Dataset
+```{r}
+visit_data <- tibble(select(data, -c(spend, account, Customer_ID)))
+
+visit_data
+```
+
+## Dividing visit dataset into training and testing dataset and balancing the training data to have 50-50 proportion of 0s and 1s in visit using oversampling method
+```{r}
+
+set.seed(100)
+
+vsplit <- sample.split(visit_data$visit, 0.7)
+
+training_vdata <-subset(visit_data, vsplit == TRUE)
+
+testing_vdata <- subset(visit_data, vsplit == FALSE)
+
+```
+
+
+
+
+#overwriting training_vdata with oversampled dataset
+```{r}
+training_vdata <- ovun.sample(visit ~ . , data = training_vdata, method = "over", p = 0.5)$data
+
+prop.table(table(training_vdata$visit))
+
+
+```
+
+
+
+## Feature selection using Mutual Information Gain
+
+```{r}
+attribute_weights <- information.gain(visit ~., training_vdata)
+
+# Print weights
+print(attribute_weights)
+
+
+# Let's save a copy of the weights
+df <- attribute_weights
+
+# add row names as a column to keep them during ordering
+df$attr <- rownames(attribute_weights)
+
+# Let's sort the weights in decreasing order of information gain values.
+# We will use arrange() function 
+df <- arrange(df, -df$attr_importance)
+
+# Plot the weight
+barplot(df$attr_importance, names = df$attr, las = 2, ylim = c(0, 0.1))
+
+```
+We aim to remove all the features having information-gain <= 0. Also, we can see that purchase_segment column has higher information gain value than purchase column. Since both of them convey the same thing, hence we are going to remove purchase column. 
+
+```{r}
+df <- df[df$attr_importance > 0,]
+training_vdata <- select(training_vdata, df$attr, c("visit"), -c("purchase"))
+
+testing_vdata <- select(testing_vdata, df$attr, c("visit"), -c("purchase"))
+
+```
+
+
+## Creating Spend Dataset, along with removing rows where there are na values in spend and removing the visit column and redundant columns (account and Customer ID)
+
+```{r}
+spend_data <- data %>% filter(visit == 1 & !is.na(spend)) %>% select(-c(visit, account, Customer_ID)) %>% tibble()
+
+```
+
+
+## Normalizing continuous variables in the spend_data using min-max scaling
+```{r}
+
+spend_data$purchase <- (spend_data$purchase - min(spend_data$purchase))/(max(spend_data$purchase) - min(spend_data$purchase))
+
+original_vector_of_spend<- tibble(spend_data)$spend
+
+spend_data$age <- (spend_data$age - min(spend_data$age))/(max(spend_data$age) - min(spend_data$age))
+
+spend_data$spend <- (spend_data$spend - min(spend_data$spend))/(max(spend_data$spend) - min(spend_data$spend))
+
+
+```
+
+## Dividing spend dataset into training and testing dataset
+```{r}
+
+set.seed(101)
+
+ssplit <- sample.split(spend_data$spend, 0.7)
+
+training_sdata <-subset(spend_data, ssplit == TRUE)
+
+testing_sdata <- subset(spend_data, ssplit == FALSE)
+
+```
+
+#creating a column wherein the values are "Did Target", "Did not Target" based on company's random process.
+```{r}
+
+# Creatng a column of which customers the company actually targetted in the copy of the data.
+dataset <- tibble(data)
+empty <- c()
+for (x in as.numeric(rownames(dataset)))
+  {if (dataset$email_segment[x]%in%c("Womens E-Mail", "mens E-Mail")) {empty <- append(empty, "Did Target")} else {empty <- append(empty, "Did Not Target")}
+    
+  
+}
+
+
+
+dataset$Target <- as.factor(empty)
+
+
+
+```
+
+
+#creating three scenarios for each customer by duplicating the records and changing the email segment values accordingly
+```{r warning=FALSE}
+summary(dataset)
+set <- dataset[rep(c(1:length(dataset$Customer_ID)), 3),]
+set <- arrange(set, Customer_ID)
+
+summary(set)
+
+vectora <- seq(1,length(set$email_segment), by=3 )
+
+summary(vectora)
+
+for (y in vectora){
+  if (set$email_segment[y] == "Womens E-Mail"){
+    set$email_segment[y + 1] <- "Mens E-Mail"
+    set$email_segment[y + 2] <- "No E-Mail"}
+  else 
+  {if (set$email_segment[y] == "Mens E-Mail")
+  {set$email_segment[y + 1] <- "Womens E-Mail"
+    set$email_segment[y + 2] <- "No E-Mail"}
+    else 
+    {set$email_segment[y + 1] <- "Mens E-Mail"
+      set$email_segment[y + 2] <- "Womens E-Mail"}}
+}
+
+set
+```
+
+
+
+## Modelling
+
+### Section 1: Modelling for predicting visit
+
+#### Logistic regression
+```{r}
+
+# Build a logistic regression model assign it to Log_v_Reg
+Log_v_Reg <- glm(visit ~ . , data = training_vdata, family = "binomial")
+
+```
+
+```{r}
+# Predict the class probabilities of the test data
+LogReg_v_pred <- predict(Log_v_Reg,testing_vdata, type="response")
+#return probabilities(class score)
+
+# Predict the class 
+LOGREG_visit <- ifelse( LogReg_v_pred  > 0.5, "1", "0")
+
+
+# Save the predictions as factor variables
+LOGREG_visit <- as.factor(LOGREG_visit)
+
+```
+
+##### plotting ROC graph for Logistic regression model
+```{r}
+library(pROC)
+ROC_logr <- roc(testing_vdata$visit, LogReg_v_pred)
+ggroc(ROC_logr, legacy.axes=TRUE) + xlab("FPR") + ylab("TPR") +
+   geom_abline(intercept = 0, slope = 1, 
+               color = "darkgrey", linetype = "dashed")
+
+```
+
+### Random Forest 
+
+```{r}
+RF_model <- randomForest(visit ~., training_vdata)
+
+# Predict the class of the test data
+RF_pred <- predict(RF_model, testing_vdata, type = "class")
+
+```
+
+### Plotting ROC graph of Random Forest Model
+```{r}
+RF_prob <- predict(RF_model, testing_vdata, type = "prob")
+ROC_RF <- roc(testing_vdata$visit, RF_prob[, 2])
+ggroc(ROC_RF, legacy.axes=TRUE) + xlab("FPR") + ylab("TPR") +
+   geom_abline(intercept = 0, slope = 1, 
+               color = "darkgrey", linetype = "dashed")
+```
+
+### decision Tree
+
+```{r}
+
+model.decTree <- tree(visit ~ ., data = training_vdata, control = tree.control(nrow(training_vdata), mindev = 0))
+
+summary(model.decTree)
+
+Dec_pred <- predict(model.decTree, testing_vdata, type = "class")
+
+
+```
+
+### Plotting ROC graph of Decision Tree
+
+```{r}
+
+Dec_prob <- predict(model.decTree, testing_vdata, probability= T)
+ROC_Dec <- roc(testing_vdata$visit, Dec_prob[,2])
+ggroc(ROC_Dec, legacy.axes=TRUE) + xlab("FPR") + ylab("TPR") +
+   geom_abline(intercept = 0, slope = 1, 
+               color = "darkgrey", linetype = "dashed")
+
+
+```
+
+## pruning the existing decision tree
+```{r}
+cv.result <- cv.tree(model.decTree, FUN = prune.misclass)
+
+# Let's plot the last 10 values
+tree_size = tail(cv.result$size, 10)
+misclassifiations = tail(cv.result$dev, 10)
+
+plot(tree_size, misclassifiations/nrow(training_vdata), type = "b",
+     xlab = "Tree Size", ylab = "CV Rate of Misclassification")
+```
+
+```{r}
+model.decTree.pruned <- prune.misclass(model.decTree, best = 30)
+
+# summary of the pruned tree
+summary(model.decTree.pruned)
+
+# prediction
+predict_tree <- predict(model.decTree.pruned, testing_vdata, type="class")
+
+plot(model.decTree.pruned)
+
+```
+
+## Plotting ROC graph of pruned Decision Tree
+
+```{r}
+pruned_Dec_prob <- predict(model.decTree.pruned, testing_vdata, probability= T)
+roc.pruned <- roc(testing_vdata$visit, pruned_Dec_prob[,2])
+ggroc(roc.pruned, legacy.axes=TRUE) + xlab("FPR") + ylab("TPR") +
+   geom_abline(intercept = 0, slope = 1, 
+               color = "darkgrey", linetype = "dashed")
+```
+
+
+## SVM
+```{r}
+#build SVM model
+svm <- svm(visit~., data=training_vdata, kernel="radial", scale=TRUE, probability= TRUE)
+
+#print svm 
+print(svm)
+```
+
+## Plotting ROC graph of svm
+```{r}
+svm_predict = predict(svm, testing_vdata, probability = T)
+prob.svm <- attr(predict(svm, testing_vdata, probability = TRUE), "probabilities")
+
+
+roc.svm <- roc(testing_vdata$visit, prob.svm[,2])
+
+ggroc(roc.svm, legacy.axes=TRUE) + xlab("FPR") + ylab("TPR") +
+   geom_abline(intercept = 0, slope = 1, 
+               color = "darkgrey", linetype = "dashed")
+```
+
+
+### SECTION 2- Modelling for predicting spend
+# linear regression
+
+Initially Modelling linear regression on all features
+
+```{r}
+install.packages("regclass")
+library("regclass")
+
+multiple_lin <- lm(spend~., data= training_sdata)
+summary(multiple_lin)
+```
+Importing library for performing subset selection wrapper method
+```{r}
+library(leaps)
+```
+
+
+```{r}
+Best_Subset <-
+    regsubsets(spend~.,
+               data =training_sdata,
+               nbest = 1,      # 1 best model for each number of predictors
+               nvmax = NULL,    # NULL for no limit on number of variables
+               force.in = NULL, force.out = NULL,
+               method = "exhaustive")
+summary_best_subset <- summary(Best_Subset)
+
+summary_best_subset
+as.data.frame(summary_best_subset$outmat)
+
+```
+
+
+```{r}
+which.max(summary_best_subset$adjr2)
+
+```
+## Best Features Selected
+```{r}
+summary_best_subset$which[18,]
+
+```
+
+## Created Dummy Variables for factor features that ere selected
+```{r}
+spend_data_for_linear_regression <- tibble(spend_data)
+recency2 <- c()
+recency2[spend_data_for_linear_regression$recency == 2] <- 1
+recency2[spend_data_for_linear_regression$recency != 2] <- 0
+recency2 <- as.factor(recency2)
+
+recency3 <- c()
+recency3[spend_data_for_linear_regression$recency == 3] <- 1
+recency3[spend_data_for_linear_regression$recency != 3] <- 0
+recency3 <- as.factor(recency3)
+
+recency9 <- c()
+recency9[spend_data_for_linear_regression$recency == 9] <- 1
+recency9[spend_data_for_linear_regression$recency != 9] <- 0
+recency9 <- as.factor(recency9)
+
+recency10 <- c()
+recency10[spend_data_for_linear_regression$recency == 10] <- 1
+recency10[spend_data_for_linear_regression$recency != 10] <- 0
+recency10 <- as.factor(recency10)
+
+recency11 <- c()
+recency11[spend_data_for_linear_regression$recency == 11] <- 1
+recency11[spend_data_for_linear_regression$recency != 11] <- 0
+recency11 <- as.factor(recency11)
+
+recency12 <- c()
+recency12[spend_data_for_linear_regression$recency == 12] <- 1
+recency12[spend_data_for_linear_regression$recency != 12] <- 0
+recency12 <- as.factor(recency12)
+
+
+marriage2 <- c()
+marriage2[spend_data_for_linear_regression$marriage == 2] <- 1
+marriage2[spend_data_for_linear_regression$marriage != 2] <- 0
+marriage2 <- as.factor(marriage2)
+
+spend_data_for_linear_regression$recency2 <- recency2
+spend_data_for_linear_regression$recency3 <- recency3
+spend_data_for_linear_regression$recency9 <- recency9
+spend_data_for_linear_regression$recency10 <- recency10
+spend_data_for_linear_regression$recency11 <- recency11
+spend_data_for_linear_regression$recency12 <- recency12
+spend_data_for_linear_regression$marriage2 <- marriage2
+
+training_sdata_for_linear_regression <- spend_data_for_linear_regression[ssplit == TRUE,]
+
+testing_sdata_for_linear_regression <- spend_data_for_linear_regression[ssplit == FALSE,]
+
+multiple_linear1 <- lm(spend ~ recency2 + recency3 + recency9 + recency10 + recency11 + recency12 + marriage2 + email_segment + delivery + payment_card + purchase_segment + womens, data= training_sdata_for_linear_regression)
+
+summary(multiple_linear1)
+
+
+```
+
+
+
+#KNN
+```{r}
+library('caret')
+knn <- knnreg(spend~., training_sdata, k = sqrt(nrow(training_sdata)))
+
+knn_ <-knnreg(spend~recency2 + recency3 + recency9 + recency10 + recency11 + recency12 + marriage2 + email_segment + delivery + payment_card + purchase_segment + womens, training_sdata_for_linear_regression, k = sqrt(nrow(training_sdata_for_linear_regression)))
+
+```
+
+
+#Random Forest Regression
+```{r}
+#random forest regression
+{r}
+# Create random forest for regression
+spend_rf <- randomForest(spend ~ ., data = training_sdata,
+                         importance = TRUE, na.action = na.omit)
+
+summary(spend_rf)
+
+print(spend_rf)
+pre_spend_rf <- predict(spend_rf, testing_sdata)
+summary(pre_spend_rf)
+
+spend_rf_ <- randomForest(spend~recency2 + recency3 + recency9 + recency10 + recency11 + recency12 + marriage2 + email_segment + delivery + payment_card + purchase_segment + womens, data = training_sdata_for_linear_regression)
+```
+
+
+
+
+#DECISION TREE
+```{r}
+fit.tree = rpart(spend ~ ., data = training_sdata, method="anova", cp=0.008)
+
+pred.tree = predict(fit.tree, testing_sdata)
+
+fit.tree_ = rpart(spend~recency2 + recency3 + recency9 + recency10 + recency11 + recency12 + marriage2 + email_segment + delivery + payment_card + purchase_segment + womens, data = training_sdata_for_linear_regression, method = "anova", cp=0.008)
+
+```
+
+
+```{r}
+# Finding the best CP value
+printcp(fit.tree)
+bestcp <- fit.tree$cptable[which.min(fit.tree$cptable[,"xerror"]),"CP"]
+bestcp
+
+best_cp_ <- fit.tree_$cptable[which.min(fit.tree_$cptable[,"xerror"]),"CP"]
+
+```
+
+```{r}
+# Prune the tree with the best cp  value (the lowest cross-validation error - xerror)
+pruned.tree <- prune(fit.tree, cp = bestcp)
+pruned.tree_ <- prune(fit.tree_, cp=best_cp_)
+
+predictions_from_prunedtree <- predict(pruned.tree, testing_sdata)
+
+
+
+```
+
+## SVR Model
+```{r}
+#Regression with SVM
+modelsvm = svm(spend~.,training_sdata, cost = 1)
+
+#Predict using SVM regression
+predYsvm = predict(modelsvm, testing_sdata)
+
+modelsvm_ = svm(spend~recency2 + recency3 + recency9 + recency10 + recency11 + recency12 + marriage2 + email_segment + delivery + payment_card + purchase_segment + womens, training_sdata_for_linear_regression, cost=1)
+
+
+
+```
+
+
+
+# Evaluation
+
+## Section 1: Visit Model
+
+```{r}
+svm.cf <- confusionMatrix(svm_predict, testing_vdata$visit, positive="1", mode="prec_recall")
+cf.rf <- confusionMatrix(RF_pred, testing_vdata$visit, positive='1', mode = "prec_recall")
+cf.dt <- confusionMatrix(Dec_pred, testing_vdata$visit, positive='1', mode = "prec_recall")
+cf.pruned.tree <- confusionMatrix(predict_tree, testing_vdata$visit, positive='1', mode = "prec_recall")
+cf.logreg <- confusionMatrix(LOGREG_visit, testing_vdata$visit, positive='1', mode = "prec_recall")
+
+recall.svm <- svm.cf$byClass[[6]]
+recall.rf <- cf.rf$byClass[[6]]
+recall.lg <- cf.logreg$byClass[[6]]
+recall.dt <- cf.dt$byClass[[6]]
+recall.dt.p <- cf.pruned.tree$byClass[[6]]
+
+# get precision values
+prec.svm <- svm.cf$byClass[[5]]
+prec.rf <- cf.rf$byClass[[5]]
+prec.lg <- cf.logreg$byClass[[5]]
+prec.dt <- cf.dt$byClass[[5]]
+prec.dt.p <- cf.pruned.tree$byClass[[5]]
+
+# get f1
+f1.svm <- svm.cf$byClass[[7]]
+f1.rf <- cf.rf$byClass[[7]]
+f1.lg <- cf.logreg$byClass[[7]]
+f1.dt <- cf.dt$byClass[[7]]
+f1.dt.p <- cf.pruned.tree$byClass[[7]]
+
+
+
+# get accuracy
+acc.svm <- svm.cf$overall[[1]]
+acc.rf <- cf.rf$overall[[1]]
+acc.lg <- cf.logreg$overall[[1]]
+acc.dt <- cf.dt$overall[[1]]
+acc.dt.p <- cf.dt$overall[[1]]
+
+models <- c("SVM", "Random Forest", "Logistic Regression", "Decision Tree", "Pruned Decision Tree")
+recall.values <- c(recall.svm, recall.rf, recall.lg, recall.dt, recall.dt.p)
+prec.values <- c(prec.svm, prec.rf, prec.lg, prec.dt, prec.dt.p)
+f1.values <- c(f1.svm, f1.rf, f1.lg, f1.dt, f1.dt.p)
+acc.values <- c(acc.svm, acc.rf, acc.lg, acc.dt, acc.dt.p)
+
+eval.tibble <- tibble(models = models, recall = recall.values, prec = prec.values, f1 = f1.values, accuracy = acc.values)
+
+eval.tibble <- eval.tibble %>%
+  pivot_longer(cols = recall:accuracy, names_to = "cf")
+
+ggplot(eval.tibble, aes(x=models, y=value, fill=cf)) + geom_bar(stat = 'identity',  position=position_dodge()) + theme_bw() + geom_text(aes(label=round(value, 3)), position=position_dodge(width=0.9), vjust=-0.25) + labs(x="Models", y="Value", title="Confusion Matrix Evaluation", fill="Confusion Matrix") + scale_x_discrete(guide = guide_axis(n.dodge = 2))
+
+```
+
+## ROC Graph Analysis
+
+```{r}
+RF_prob <- predict(RF_model, testing_vdata, type = "prob")
+ROC_RF <- roc(testing_vdata$visit, RF_prob[, 2])
+
+LogReg_v_prob <- predict(Log_v_Reg,testing_vdata, type="response")
+ROC_logr <- roc(testing_vdata$visit, LogReg_v_prob)
+
+
+
+Dec_prob <- predict(model.decTree, testing_vdata, probability= T)
+ROC_Dec <- roc(testing_vdata$visit, Dec_prob[,2])
+
+prob.svm <- attr(predict(svm, testing_vdata, probability = TRUE), "probabilities")
+
+
+roc.svm <- roc(testing_vdata$visit, prob.svm[,2])
+
+
+pruned_Dec_prob <- predict(model.decTree.pruned, testing_vdata, probability= T)
+roc.pruned <- roc(testing_vdata$visit, pruned_Dec_prob[,2])
+
+roc.plt <- ggroc(list(RF = ROC_RF, SVM = roc.svm, LogReg = ROC_logr, DecTree = ROC_Dec, PrunDecTree = roc.pruned), legacy.axes=TRUE)+ xlab("FPR") + ylab("TPR") +
+   geom_abline(intercept = 0, slope = 1, color = "darkgrey", linetype = "dashed") + labs(title = "ROC Curve", fill = "Models")
+roc.plt
+
+roc.plt
+
+```
+
+## Plotting Gain Values
+```{r}
+GainTable_RF <- cumGainsTable(RF_prob[,2], testing_vdata$visit, resolution = 1/100)
+
+GainTable_SVM <- cumGainsTable(prob.svm[,2], testing_vdata$visit, resolution = 1/100)
+
+GainTable_LG <- cumGainsTable(LogReg_v_prob, testing_vdata$visit, resolution = 1/100)
+
+GainTable_DT <- cumGainsTable(Dec_prob[,2], testing_vdata$visit, resolution = 1/100)
+
+GainTable_DT_pruned <- cumGainsTable(pruned_Dec_prob[,2], testing_vdata$visit, resolution = 1/100)
+
+
+plot(GainTable_RF[,4], col="red", type="l",     
+xlab="Percentage of test instances", ylab="Percentage of correct predictions")
+lines(GainTable_SVM[,4], col="blue", type="l")
+lines(GainTable_LG[,4], col="green", type="l")
+lines(GainTable_DT[,4], col="yellow", type="l")
+lines(GainTable_DT_pruned[,4], col="black", type="l")
+
+
+legend("bottomright",
+c("Random Forest", "SVM", "Logistic Regression", "Decision Tree", "Pruned Decision Tree"),
+fill=c("red", "blue", "green", "yellow", "black"))
+```
+
+
+## Best Model and Threshold selection
+
+The below loop selects the model which generates the maximum expected value of profit at a particular threshold. 
+```{r}
+cost_of_sending_1_email = 1
+average_spend_by_1_person <- mean(spend_data$spend)
+vector_of_wanting_values <- c("threshold")
+profit = 0
+
+random_forest_prediction_prob <- predict(RF_model, testing_vdata, type= "prob")[,2]
+
+mens_spend_average <- mean(filter(spend_data, email_segment == "Mens E-Mail")$spend)
+
+Womens_spend_average <- mean(filter(spend_data, email_segment == "Womens E-Mail")$spend)
+
+No_email_spend_average <- mean(filter(spend_data, email_segment == "No E-Mail")$spend)
+
+filter(spend_data, email_segment == "No E-Mail")
+x <- 0
+
+for (model in list(ROC_RF, ROC_logr, ROC_Dec, roc.svm, roc.pruned)){
+  x <- x + 1
+  all_possible_values <- coords(model, ret= vector_of_wanting_values)
+  vector_of_profits <- c()
+  for (threshold_value in all_possible_values$threshold){
+      prediction_of_visit <- c()
+      if (x == 1){
+        prediction_of_visit[random_forest_prediction_prob >= threshold_value] <- 1
+        prediction_of_visit[random_forest_prediction_prob < threshold_value] <- 0
+      }
+      else {
+        if (x == 2){
+          prediction_of_visit[LogReg_v_prob >= threshold_value] <- 1
+          prediction_of_visit[LogReg_v_prob < threshold_value] <- 0
+        }
+        else
+        {
+          if (x == 3){
+            prediction_of_visit[Dec_prob[,2] >= threshold_value] <- 1
+            prediction_of_visit[Dec_prob[,2] < threshold_value] <- 0
+          }
+          else{
+            if (x == 4){
+              prediction_of_visit[prob.svm[,2] >= threshold_value] <- 1
+              prediction_of_visit[prob.svm[,2] < threshold_value] <- 0
+            }
+            else
+            {
+              prediction_of_visit[pruned_Dec_prob[,2] >= threshold_value] <- 1
+              prediction_of_visit[pruned_Dec_prob[,2] < threshold_value] <- 0
+            }
+              
+            }
+          }
+        }
+          
+        
+      testing_vdata$prediction_of_visit <- prediction_of_visit
+      
+      #calculation for true positives and fp:
+      Mens_email_dataset <- filter(testing_vdata, email_segment == "Mens E-Mail")
+      TPm <- nrow(filter(Mens_email_dataset, prediction_of_visit == 1, visit == 1))
+      FPm <- nrow(filter(Mens_email_dataset, prediction_of_visit == 1, visit == 0))
+      
+      
+      Womens_email_dataset <- filter(testing_vdata, email_segment == "Womens E-Mail")
+      
+      TPw <- nrow(filter(Womens_email_dataset, prediction_of_visit == 1, visit == 1))
+      FPw <- nrow(filter(Womens_email_dataset, prediction_of_visit == 1, visit == 0))
+      
+       
+       
+      No_email_dataset <- filter(testing_vdata, email_segment == "No E-Mail")
+      
+      TPn <- nrow(filter(No_email_dataset, prediction_of_visit == 1, visit == 1))
+      
+      FPn <- nrow(filter(No_email_dataset, prediction_of_visit == 1, visit == 0))
+      
+      
+      profit_per_customer <- (TPm*(mens_spend_average- cost_of_sending_1_email) + TPw*(Womens_spend_average - cost_of_sending_1_email) + TPn*(No_email_spend_average) - FPm*(cost_of_sending_1_email) - FPw*(cost_of_sending_1_email))/length(prediction_of_visit)
+      
+      
+      vector_of_profits <- append(vector_of_profits, profit_per_customer)
+}
+    
+  all_possible_values$profit_per_customer <- vector_of_profits
+    
+  best_row <- filter(all_possible_values, profit_per_customer == max(all_possible_values$profit_per_customer))
+    
+  if (best_row$profit_per_customer[1] >= profit){
+    profit <- best_row$profit_per_customer[1]
+    best_model_roc <- model
+    best_threshold_value <- best_row$threshold[1]
+
+  }
+}
+
+
+model_selected
+profit
+best_threshold_value
+```
+
+
+
+As we can see, SVM is the model that we should select, as at the best_threshold_value, it gives us the maximum profit per customer
+
+## Verifying with auc
+
+```{r}
+auc(ROC_RF)
+auc(ROC_logr)
+auc(ROC_Dec)
+auc(roc.svm)
+auc(roc.pruned)
+```
+
+We can see that the area under the curve of Random forest is the highest, Followed by SVM. However, as we can see that the optimum threshold value of SVM generates the highest expected profit for us. Hence, we are going to choose SVM as our model for predicting visits.
+
+
+## Section 2:Model Evaluation for predicting Spend.
+
+```{r}
+RMSE(predict(multiple_linear1, testing_sdata_for_linear_regression), testing_sdata_for_linear_regression$spend)
+
+RMSE(predict(knn, testing_sdata), testing_sdata$spend)
+
+RMSE(pre_spend_rf, testing_sdata$spend)
+
+RMSE(pred.tree, testing_sdata$spend)
+
+RMSE(predictions_from_prunedtree, testing_sdata$spend)
+
+RMSE(predYsvm, testing_sdata$spend)
+
+
+RMSE(predict(knn_, testing_sdata_for_linear_regression), testing_sdata_for_linear_regression$spend)
+
+RMSE(predict(spend_rf_, testing_sdata_for_linear_regression), testing_sdata_for_linear_regression$spend)
+
+RMSE(predict(fit.tree_, testing_sdata_for_linear_regression ), testing_sdata_for_linear_regression$spend)
+
+RMSE(predict(pruned.tree_, testing_sdata_for_linear_regression ), testing_sdata_for_linear_regression$spend)
+
+RMSE(predict(modelsvm_, testing_sdata_for_linear_regression ), testing_sdata_for_linear_regression$spend)
+
+
+
+```
+Since linear regression has the lowest RMSE value, we will use linear regression to estimate spending.
+
+Since we are using linear regression, we are going to add the dummy variable columns and all other columns that the linear regression model uses to the "set" dataset so that our model can predict spending for all customers for all scenarios. 
+
+
+
+## Implementation
+
+Adding necessary columns to original set
+```{r}
+
+"spend ~ recency2 + recency3 + recency9 + recency10 + recency11 + recency12 + marriage2 + email_segment + delivery + payment_card + purchase_segment + womens"
+
+recency2_ <- c()
+recency2_[set$recency == 2] <- 1
+recency2_[set$recency != 2] <- 0
+recency2_ <- as.factor(recency2_)
+
+recency3_ <- c()
+recency3_[set$recency == 3] <- 1
+recency3_[set$recency != 3] <- 0
+recency3_ <- as.factor(recency3_)
+
+recency9_ <- c()
+recency9_[set$recency == 9] <- 1
+recency9_[set$recency != 9] <- 0
+recency9_ <- as.factor(recency9_)
+
+recency10_ <- c()
+recency10_[set$recency == 10] <- 1
+recency10_[set$recency != 10] <- 0
+recency10_ <- as.factor(recency10_)
+
+recency11_ <- c()
+recency11_[set$recency == 11] <- 1
+recency11_[set$recency != 11] <- 0
+recency11_ <- as.factor(recency11_)
+
+recency12_ <- c()
+recency12_[set$recency == 12] <- 1
+recency12_[set$recency != 12] <- 0
+recency12_ <- as.factor(recency12_)
+
+
+marriage2_ <- c()
+marriage2_[set$marriage == 2] <- 1
+marriage2_[set$marriage != 2] <- 0
+marriage2_ <- as.factor(marriage2_)
+
+set$recency2 <- recency2_
+set$recency3 <- recency3_
+set$recency9 <- recency9_
+set$recency10 <- recency10_
+set$recency11 <- recency11_
+set$recency12 <- recency12_
+set$marriage2 <- marriage2_
+
+
+```
+## Model's recommended email for each customer
+```{r}
+final_visit_pred <- attr(predict(svm, select(set, - c("spend")), probability = TRUE), "probabilities")[,2]
+visit_prediction_for_scenarios <- c()
+visit_prediction_for_scenarios[as.numeric(final_visit_pred) >= as.numeric(best_threshold_value)] <- 1
+visit_prediction_for_scenarios[as.numeric(final_visit_pred) < as.numeric(best_threshold_value)] <- 0
+
+test_set <- tibble(set)
+test_set$visit_prediction_for_scenarios <- visit_prediction_for_scenarios
+
+length(spend_prediction)
+spend_prediction <- c()
+spend_prediction[as.numeric(test_set$visit_prediction_for_scenarios) == 1] <- predict(multiple_linear1, filter(test_set, visit_prediction_for_scenarios == 1))
+spend_prediction[as.numeric(test_set$visit_prediction_for_scenarios) != 1] <- 0
+
+test_set$spend_prediction <- spend_prediction
+test_set$actual_spend_prediction <- (test_set$spend_prediction)*(max(original_vector_of_spend) - min(original_vector_of_spend)) + min(original_vector_of_spend)
+
+
+
+
+profit_column <- c()
+profit_column[test_set$email_segment == "No E-Mail"] <- filter(test_set, email_segment == "No E-Mail")$actual_spend_prediction
+
+profit_column[test_set$email_segment != "No E-Mail"] <- filter(test_set, email_segment != "No E-Mail")$actual_spend_prediction - cost_of_sending_1_email
+
+test_set$profit_column <- profit_column
+
+
+Best_scenario_boolean_vector <- c()
+for (cus_id in dataset$Customer_ID){
+  set_of_three <- filter(test_set, Customer_ID == cus_id)
+  Best_scenario_boolean_vector <- append(Best_scenario_boolean_vector, set_of_three$profit_column == max(set_of_three$profit_column))
+}
+
+
+
+Models_output <- test_set[Best_scenario_boolean_vector,]
+Models_output <- unique(Models_output, by= "Customer_ID")
+
+Models_output
+```
+
+
+## Code to calculate Expected_profit from the Email Marketing System we created. (refer to Appendix 1 of the report)
+```{r}
+
+#Preparation of Base Case
+base_case <- tibble(test_set)
+base_case$visit_prediction_for_scenarios <- 1
+base_case$spend_prediction <- predict(multiple_linear1, test_set)
+base_case$actual_spend_prediction <- (base_case$spend_prediction)*(max(original_vector_of_spend) - min(original_vector_of_spend)) + min(original_vector_of_spend)
+ 
+
+
+#probability that the actual visit is 0 given that predicted is 1
+prob01 <- FP/(FP+TP)
+
+FP/(FP + TP)
+
+#probability that the actual visit is 1 given that predicted is 1
+prob11 <- TP/(FP + TP)
+
+#probability that the actual visit is 0 given that predicted is 0
+prob00 <- TN/(TN+FN)
+
+#probability that the actual visit is 1 given that predicted is 0
+prob10 <- FN/(TN+FN)
+
+
+
+expected_profit_from_our_model <- c()
+expected_revenue_from_our_model <- c()
+expected_visit_after_deployment <- c()
+
+
+for (cus_id in dataset$Customer_ID){
+  set_of_three <- filter(test_set, Customer_ID == cus_id)
+ #Section 2: Our Model Expected Profit
+  sum_of_profit_after_deployment <- 0
+  sum_of_revenue <- 0
+  sum_of_expected_visit_after_deployment <- 0
+  Mens_email_visit_prediction <- filter(set_of_three, email_segment == "Mens E-Mail")$visit_prediction_for_scenarios[1]
+  Womens_email_visit_prediction <- filter(set_of_three, email_segment == "Womens E-Mail")$visit_prediction_for_scenarios[1]
+  No_email_visit_prediction <- filter(set_of_three, email_segment == "No E-Mail")$visit_prediction_for_scenarios[1]
+  
+  
+  
+  
+  email_sent_by_model <- filter(Models_output, Customer_ID == cus_id)$email_segment[1]
+  spend_on_visit <-  filter(Models_output, Customer_ID == cus_id)$actual_spend_prediction[1]
+  
+  
+  
+  if (Mens_email_visit_prediction == 1 & Womens_email_visit_prediction == 1 & No_email_visit_prediction == 1){
+    probability_of_actualoutcome000 <- prob01 * prob01 * prob01
+    probability_of_actualoutcome001 <- prob01 * prob01 * prob11
+    probability_of_actualoutcome011 <- prob01 * prob11 * prob11 
+    probability_of_actualoutcome110 <- prob11 * prob11 * prob01
+    
+    probability_of_actualoutcome010 <- prob01 * prob11 * prob01
+    probability_of_actualoutcome100 <- prob11 * prob01 * prob01
+    probability_of_actualoutcome101 <- prob11 * prob01 * prob11
+    probability_of_actualoutcome111 <- prob11 * prob11 * prob11
+    
+    if (email_sent_by_model == "Womens E-Mail"){
+    
+      sum_of_profit_after_deployment <- sum_of_profit_after_deployment + probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (spend_on_visit - cost_of_sending_1_email) + probability_of_actualoutcome110 * (spend_on_visit-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (spend_on_visit-cost_of_sending_1_email) + probability_of_actualoutcome100 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (spend_on_visit - cost_of_sending_1_email)
+      
+      sum_of_revenue <- sum_of_revenue + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (spend_on_visit) + probability_of_actualoutcome110 * (spend_on_visit)  + probability_of_actualoutcome010 * (spend_on_visit) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_expected_visit_after_deployment <- sum_of_expected_visit_after_deployment + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (1) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1)
+      
+    }
+    else if (email_sent_by_model == "Mens E-Mail"){
+      sum_of_profit_after_deployment <- sum_of_profit_after_deployment + probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (-1* cost_of_sending_1_email) + probability_of_actualoutcome110 * (spend_on_visit-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome100 * (spend_on_visit-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (spend_on_visit-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (spend_on_visit - cost_of_sending_1_email)
+      
+      sum_of_revenue <- sum_of_revenue + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (spend_on_visit)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (spend_on_visit) + probability_of_actualoutcome101 * (spend_on_visit) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_expected_visit_after_deployment <- sum_of_expected_visit_after_deployment + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (1) + probability_of_actualoutcome101 * (1) + probability_of_actualoutcome111 * (1)
+      
+      
+    }
+    else{
+      sum_of_profit_after_deployment <- sum_of_profit_after_deployment + probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(spend_on_visit) + probability_of_actualoutcome011 * (spend_on_visit) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_revenue <- sum_of_revenue + probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(spend_on_visit) + probability_of_actualoutcome011 * (spend_on_visit) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_expected_visit_after_deployment <- sum_of_expected_visit_after_deployment + probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(1) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1)
+      
+    }
+  
+    
+  }
+  else if (Mens_email_visit_prediction == 1 & Womens_email_visit_prediction == 0 & No_email_visit_prediction == 1){
+    probability_of_actualoutcome000 <- prob01 * prob11 * prob01
+    probability_of_actualoutcome001 <- prob01 * prob00 * prob11
+    probability_of_actualoutcome011 <- prob01 * prob10 * prob11 
+    probability_of_actualoutcome110 <- prob11 * prob10 * prob01
+    
+    probability_of_actualoutcome010 <- prob01 * prob10 * prob01
+    probability_of_actualoutcome100 <- prob11  * prob00 * prob01
+    probability_of_actualoutcome101 <- prob11  * prob00 * prob11 
+    probability_of_actualoutcome111 <- prob11  * prob10 * prob11 
+    
+    if (email_sent_by_model == "Mens E-Mail"){
+    
+      sum_of_profit_after_deployment <- sum_of_profit_after_deployment + probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (-1 * cost_of_sending_1_email) + probability_of_actualoutcome110 * (spend_on_visit-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (-1 * cost_of_sending_1_email) + probability_of_actualoutcome100 * (spend_on_visit -1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (spend_on_visit -1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (spend_on_visit - cost_of_sending_1_email)
+      
+      sum_of_revenue <- sum_of_revenue + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (spend_on_visit)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (spend_on_visit) + probability_of_actualoutcome101 * (spend_on_visit) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_expected_visit_after_deployment <- sum_of_expected_visit_after_deployment + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (1) + probability_of_actualoutcome101 * (1) + probability_of_actualoutcome111 * (1)
+    }
+    else if (email_sent_by_model == "No E-Mail"){
+      sum_of_profit_after_deployment <- sum_of_profit_after_deployment + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(spend_on_visit) + probability_of_actualoutcome011 * (spend_on_visit) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (spend_on_visit) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_revenue <- sum_of_revenue + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(spend_on_visit) + probability_of_actualoutcome011 * (spend_on_visit) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (spend_on_visit) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_expected_visit_after_deployment <- sum_of_expected_visit_after_deployment + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(1) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (1) + probability_of_actualoutcome111 * (1)
+      
+    }
+    
+    
+  }
+  else if (Mens_email_visit_prediction == 1 & Womens_email_visit_prediction == 0 & No_email_visit_prediction == 0){
+     probability_of_actualoutcome000 <- prob01 * prob00 * prob00
+    probability_of_actualoutcome001 <- prob01 * prob00 * prob10
+    probability_of_actualoutcome011 <- prob01 * prob10 * prob10
+    probability_of_actualoutcome110 <- prob11  * prob10 * prob00
+    
+    probability_of_actualoutcome010 <- prob01 * prob10 * prob00
+    probability_of_actualoutcome100 <- prob11  * prob00 * prob00
+    probability_of_actualoutcome101 <- prob11  * prob00 * prob10
+    probability_of_actualoutcome111 <- prob11  * prob10 * prob10
+    
+    
+    }
+    if (email_sent_by_model == "Mens E-Mail"){
+      sum_of_profit_after_deployment <- sum_of_profit_after_deployment + probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (-1* cost_of_sending_1_email) + probability_of_actualoutcome110 * (spend_on_visit-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome100 * (spend_on_visit-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (spend_on_visit-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (spend_on_visit - cost_of_sending_1_email)
+      
+      sum_of_revenue <- sum_of_revenue + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (spend_on_visit)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (spend_on_visit) + probability_of_actualoutcome101 * (spend_on_visit) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_expected_visit_after_deployment <- sum_of_expected_visit_after_deployment + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (1) + probability_of_actualoutcome101 * (1) + probability_of_actualoutcome111 * (1)
+      
+    
+
+  }
+  else if (Mens_email_visit_prediction == 0 & Womens_email_visit_prediction == 1 & No_email_visit_prediction == 0){
+    
+    probability_of_actualoutcome000 <- prob00 * prob01 * prob00
+    probability_of_actualoutcome001 <- prob00 * prob01 * prob10
+    probability_of_actualoutcome011 <- prob00 * prob11  * prob10
+    probability_of_actualoutcome110 <- prob10 * prob11  * prob00
+    
+    probability_of_actualoutcome010 <- prob00 * prob11  * prob00
+    probability_of_actualoutcome100 <- prob10 * prob01* prob00
+    probability_of_actualoutcome101 <- prob10 * prob01 * prob10
+    probability_of_actualoutcome111 <- prob10 * prob11  * prob10
+    
+    
+    
+      sum_of_profit_after_deployment <- sum_of_profit_after_deployment + probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (spend_on_visit-1* cost_of_sending_1_email) + probability_of_actualoutcome110 * (spend_on_visit-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (spend_on_visit-1*cost_of_sending_1_email) + probability_of_actualoutcome100 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (spend_on_visit - cost_of_sending_1_email)
+      
+      sum_of_revenue <- sum_of_revenue + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (spend_on_visit) + probability_of_actualoutcome110 * (spend_on_visit)  + probability_of_actualoutcome010 * (spend_on_visit) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_expected_visit_after_deployment <- sum_of_expected_visit_after_deployment + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (1) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1)
+    
+
+}
+  else if (Mens_email_visit_prediction == 1 & Womens_email_visit_prediction == 1 & No_email_visit_prediction == 0){
+    probability_of_actualoutcome000 <- prob01 * prob01 * prob00
+    probability_of_actualoutcome001 <- prob01 * prob01 * prob10
+    probability_of_actualoutcome011 <- prob01 * prob11  * prob10
+    probability_of_actualoutcome110 <- prob11 * prob11  * prob00
+    
+    probability_of_actualoutcome010 <- prob01 * prob11  * prob00
+    probability_of_actualoutcome100 <- prob11  * prob01 * prob00
+    probability_of_actualoutcome101 <- prob11  * prob01 * prob10
+    probability_of_actualoutcome111 <- prob11  * prob11  * prob10
+    
+    if (email_sent_by_model == "Womens E-Mail"){
+    
+      sum_of_profit_after_deployment <- sum_of_profit_after_deployment + probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (spend_on_visit - cost_of_sending_1_email) + probability_of_actualoutcome110 * (spend_on_visit-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (spend_on_visit-cost_of_sending_1_email) + probability_of_actualoutcome100 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (spend_on_visit - cost_of_sending_1_email)
+      
+      sum_of_revenue <- sum_of_revenue + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (spend_on_visit) + probability_of_actualoutcome110 * (spend_on_visit)  + probability_of_actualoutcome010 * (spend_on_visit) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_expected_visit_after_deployment <- sum_of_expected_visit_after_deployment + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (1) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1)
+    }
+    else if (email_sent_by_model == "Mens E-Mail"){
+      sum_of_profit_after_deployment <- sum_of_profit_after_deployment + probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (-1* cost_of_sending_1_email) + probability_of_actualoutcome110 * (spend_on_visit-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome100 * (spend_on_visit-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (spend_on_visit-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (spend_on_visit - cost_of_sending_1_email)
+      
+      sum_of_revenue <- sum_of_revenue + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (spend_on_visit)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (spend_on_visit) + probability_of_actualoutcome101 * (spend_on_visit) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_expected_visit_after_deployment <- sum_of_expected_visit_after_deployment + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (1) + probability_of_actualoutcome101 * (1) + probability_of_actualoutcome111 * (1)
+      
+      
+    }
+    
+  }
+  else if (Mens_email_visit_prediction == 0 & Womens_email_visit_prediction == 1 & No_email_visit_prediction == 1){
+    probability_of_actualoutcome000 <- prob00 * prob01 * prob01
+    probability_of_actualoutcome001 <- prob00 * prob01 * prob11 
+    probability_of_actualoutcome011 <- prob00 * prob11  * prob11 
+    probability_of_actualoutcome110 <- prob10 * prob11  * prob01
+    
+    probability_of_actualoutcome010 <- prob00 * prob11  * prob01
+    probability_of_actualoutcome100 <- prob10 * prob01 * prob01
+    probability_of_actualoutcome101 <- prob10 * prob01 * prob11 
+    probability_of_actualoutcome111 <- prob10 * prob11  * prob11 
+    
+    if (email_sent_by_model == "Womens E-Mail"){
+    
+      sum_of_profit_after_deployment <- sum_of_profit_after_deployment + probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (spend_on_visit - cost_of_sending_1_email) + probability_of_actualoutcome110 * (spend_on_visit-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (spend_on_visit-cost_of_sending_1_email) + probability_of_actualoutcome100 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (spend_on_visit - cost_of_sending_1_email)
+      
+      sum_of_revenue <- sum_of_revenue + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (spend_on_visit) + probability_of_actualoutcome110 * (spend_on_visit)  + probability_of_actualoutcome010 * (spend_on_visit) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_expected_visit_after_deployment <- sum_of_expected_visit_after_deployment + probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (1) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1)
+    }
+   
+    else{
+      sum_of_profit_after_deployment <- sum_of_profit_after_deployment + probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(spend_on_visit) + probability_of_actualoutcome011 * (spend_on_visit) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_revenue <- sum_of_revenue + probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(spend_on_visit) + probability_of_actualoutcome011 * (spend_on_visit) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (spend_on_visit)
+      
+      sum_of_expected_visit_after_deployment <- sum_of_expected_visit_after_deployment + probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(1) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1)
+      
+    }
+  }
+  else if (Mens_email_visit_prediction == 0 & Womens_email_visit_prediction == 0 & No_email_visit_prediction == 1){
+     probability_of_actualoutcome000 <- prob00 * prob00 * prob01
+    probability_of_actualoutcome001 <- prob00 * prob00 * prob11 
+    probability_of_actualoutcome011 <- prob00 * prob10 * prob11 
+    probability_of_actualoutcome110 <- prob10 * prob10 * prob01
+    
+    probability_of_actualoutcome010 <- prob00 * prob10 * prob01
+    probability_of_actualoutcome100 <- prob10 * prob00 * prob01
+    probability_of_actualoutcome101 <- prob10 * prob00 * prob11 
+    probability_of_actualoutcome111 <- prob10 * prob10 * prob11 
+    
+    sum_of_profit_after_deployment <- sum_of_profit_after_deployment + probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(spend_on_visit) + probability_of_actualoutcome011 * (spend_on_visit) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (spend_on_visit)
+    
+    sum_of_revenue = sum_of_revenue + probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(spend_on_visit) + probability_of_actualoutcome011 * (spend_on_visit) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (spend_on_visit)
+    
+    sum_of_expected_visit_after_deployment = sum_of_expected_visit_after_deployment + probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(1) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1)
+
+  }
+  else{
+    sum_of_profit_after_deployment <- sum_of_profit_after_deployment + 0
+  }
+ expected_profit_from_our_model <- append(expected_profit_from_our_model, sum_of_profit_after_deployment)
+ 
+ expected_revenue_from_our_model <- append(expected_revenue_from_our_model, sum_of_revenue)
+  
+ expected_visit_after_deployment <- append(expected_visit_after_deployment, sum_of_expected_visit_after_deployment)
+  
+}
+
+
+
+
+Models_output$expected_profit_from_our_model <- expected_profit_from_our_model
+Models_output$expected_revenue <- expected_revenue_from_our_model
+
+#expected profit from new Email Marketing System
+sum(Models_output$expected_profit_from_our_model)
+
+#Expected Revenue from new Email Marketing System
+sum(Models_output$expected_revenue)
+
+```
+
+
+
+## Expected profit and expected revenue from existing Email marketing System of Universal plus
+```{r}
+
+
+expected_profit_from_the_companys_old_model <- c()
+expected_visit_from_the_companys_old_model <- c()
+expected_revenue_from_the_companys_old_model <- c()
+
+for (cus_id in dataset$Customer_ID){
+  #section 1: companys_model_expected_profit
+  set_of_three <- filter(test_set, Customer_ID == cus_id)
+  Base_case_mens_spend_prediction <- filter(base_case, Customer_ID == cus_id, email_segment == "Mens E-Mail")$actual_spend_prediction[1]
+  Base_case_Womens_spend_prediction <- filter(base_case, Customer_ID == cus_id, email_segment == "Womens E-Mail")$actual_spend_prediction[1]
+  Base_case_No_Email_spend_prediction <- filter(base_case, Customer_ID == cus_id, email_segment == "No E-Mail")$actual_spend_prediction[1]
+  sum_of_profit_before_deployment = 0
+  Mens_email_visit_prediction <- filter(set_of_three, email_segment == "Mens E-Mail")$visit_prediction_for_scenarios[1]
+  Womens_email_visit_prediction <- filter(set_of_three, email_segment == "Womens E-Mail")$visit_prediction_for_scenarios[1]
+  No_email_visit_prediction <- filter(set_of_three, email_segment == "Womens E-Mail")$visit_prediction_for_scenarios[1]
+  sum_of_revenue_before_deployment <- 0
+  sum_of_expected_visit_before_deployment <- 0
+  
+  
+  #1
+  if (Mens_email_visit_prediction == 1 & Womens_email_visit_prediction == 1 & No_email_visit_prediction == 1){
+    probability_of_actualoutcome000 <- prob01 * prob01 * prob01
+    probability_of_actualoutcome001 <- prob01 * prob01 * prob11
+    probability_of_actualoutcome011 <- prob01 * prob11 * prob11 
+    probability_of_actualoutcome110 <- prob11 * prob11 * prob01
+    
+    probability_of_actualoutcome010 <- prob01 * prob11 * prob01
+    probability_of_actualoutcome100 <- prob11 * prob01 * prob01
+    probability_of_actualoutcome101 <- prob11 * prob01 * prob11
+    probability_of_actualoutcome111 <- prob11 * prob11 * prob11
+    
+    for (email in set_of_three$email_segment){
+      if (email == "Womens E-Mail"){
+      
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33*(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email) + probability_of_actualoutcome100 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email))
+        
+         sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction))
+         
+         sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33*(probability_of_actualoutcome000*(1) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (1) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+         
+         
+      }
+      else if (email == "Mens E-Mail"){
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 *(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (-1* cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (1) + probability_of_actualoutcome101 * (1) + probability_of_actualoutcome111 * (1))
+        
+        
+      }
+      else{
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(1) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+      
+        
+    }}
+  
+    
+  }
+  #2
+  else if (Mens_email_visit_prediction == 1 & Womens_email_visit_prediction == 0 & No_email_visit_prediction == 1){
+    probability_of_actualoutcome000 <- prob01 * prob11 * prob01
+    probability_of_actualoutcome001 <- prob01 * prob00 * prob11
+    probability_of_actualoutcome011 <- prob01 * prob10 * prob11 
+    probability_of_actualoutcome110 <- prob11 * prob10 * prob01
+    
+    probability_of_actualoutcome010 <- prob01 * prob10 * prob01
+    probability_of_actualoutcome100 <- prob11  * prob00 * prob01
+    probability_of_actualoutcome101 <- prob11  * prob00 * prob11 
+    probability_of_actualoutcome111 <- prob11  * prob10 * prob11 
+    
+    for (email in set_of_three$email_segment){
+      if (email == "Womens E-Mail"){
+      
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33*(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email) + probability_of_actualoutcome100 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (1) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+      }
+      else if (email == "Mens E-Mail"){
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 *(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (-1* cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (1) + probability_of_actualoutcome101 * (1) + probability_of_actualoutcome111 * (1))
+        
+        
+      }
+      else{
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+      
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(1) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+    }}
+    
+    
+  }
+  #3
+  else if (Mens_email_visit_prediction == 1 & Womens_email_visit_prediction == 0 & No_email_visit_prediction == 0){
+     probability_of_actualoutcome000 <- prob01 * prob00 * prob00
+    probability_of_actualoutcome001 <- prob01 * prob00 * prob10
+    probability_of_actualoutcome011 <- prob01 * prob10 * prob10
+    probability_of_actualoutcome110 <- prob11  * prob10 * prob00
+    
+    probability_of_actualoutcome010 <- prob01 * prob10 * prob00
+    probability_of_actualoutcome100 <- prob11  * prob00 * prob00
+    probability_of_actualoutcome101 <- prob11  * prob00 * prob10
+    probability_of_actualoutcome111 <- prob11  * prob10 * prob10
+    
+    
+    
+    for (email in set_of_three$email_segment){
+      if (email == "Womens E-Mail"){
+      
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33*(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email) + probability_of_actualoutcome100 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (1) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+      }
+      else if (email == "Mens E-Mail"){
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 *(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (-1* cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (1) + probability_of_actualoutcome101 * (1) + probability_of_actualoutcome111 * (1))
+        
+      }
+      else{
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+      
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(1) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+    }}
+      
+  } 
+  #4
+  else if (Mens_email_visit_prediction == 0 & Womens_email_visit_prediction == 1 & No_email_visit_prediction == 0){
+    
+    probability_of_actualoutcome000 <- prob00 * prob01 * prob00
+    probability_of_actualoutcome001 <- prob00 * prob01 * prob10
+    probability_of_actualoutcome011 <- prob00 * prob11  * prob10
+    probability_of_actualoutcome110 <- prob10 * prob11  * prob00
+    
+    probability_of_actualoutcome010 <- prob00 * prob11  * prob00
+    probability_of_actualoutcome100 <- prob10 * prob01* prob00
+    probability_of_actualoutcome101 <- prob10 * prob01 * prob10
+    probability_of_actualoutcome111 <- prob10 * prob11  * prob10
+    
+    
+    for (email in set_of_three$email_segment){
+      if (email == "Womens E-Mail"){
+      
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33*(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email) + probability_of_actualoutcome100 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment<- sum_of_revenue_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment<- sum_of_expected_visit_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (1) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+      }
+      
+      else if (email == "Mens E-Mail"){
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 *(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (-1* cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (1) + probability_of_actualoutcome101 * (1) + probability_of_actualoutcome111 * (1))
+        
+      }
+      else{
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(1) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+      
+      
+    }}
+
+  }
+  #5
+  else if (Mens_email_visit_prediction == 1 & Womens_email_visit_prediction == 1 & No_email_visit_prediction == 0){
+    probability_of_actualoutcome000 <- prob01 * prob01 * prob00
+    probability_of_actualoutcome001 <- prob01 * prob01 * prob10
+    probability_of_actualoutcome011 <- prob01 * prob11  * prob10
+    probability_of_actualoutcome110 <- prob11 * prob11  * prob00
+    
+    probability_of_actualoutcome010 <- prob01 * prob11  * prob00
+    probability_of_actualoutcome100 <- prob11  * prob01 * prob00
+    probability_of_actualoutcome101 <- prob11  * prob01 * prob10
+    probability_of_actualoutcome111 <- prob11  * prob11  * prob10
+    
+    for (email in set_of_three$email_segment){
+      if (email == "Womens E-Mail"){
+      
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33*(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email) + probability_of_actualoutcome100 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_revenue_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (1) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+        
+        
+        
+      }
+      else if (email == "Mens E-Mail"){
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 *(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (-1* cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (1) + probability_of_actualoutcome101 * (1) + probability_of_actualoutcome111 * (1))
+        
+      }
+      else{
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+      
+        sum_of_expected_profit_before_deployment <- sum_of_expected_profit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(1) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+      
+    }}
+    
+  }
+  #6
+  else if (Mens_email_visit_prediction == 0 & Womens_email_visit_prediction == 1 & No_email_visit_prediction == 1){
+    probability_of_actualoutcome000 <- prob00 * prob01 * prob01
+    probability_of_actualoutcome001 <- prob00 * prob01 * prob11 
+    probability_of_actualoutcome011 <- prob00 * prob11  * prob11 
+    probability_of_actualoutcome110 <- prob10 * prob11  * prob01
+    
+    probability_of_actualoutcome010 <- prob00 * prob11  * prob01
+    probability_of_actualoutcome100 <- prob10 * prob01 * prob01
+    probability_of_actualoutcome101 <- prob10 * prob01 * prob11 
+    probability_of_actualoutcome111 <- prob10 * prob11  * prob11 
+    
+    for (email in set_of_three$email_segment){
+      if (email == "Womens E-Mail"){
+      
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33*(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email) + probability_of_actualoutcome100 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_profit_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (1) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+      }
+      else if (email == "Mens E-Mail"){
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 *(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (-1* cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (1) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+        
+      }
+      else{
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(1) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+      
+    }}
+  }
+  #7
+  else if (Mens_email_visit_prediction == 0 & Womens_email_visit_prediction == 0 & No_email_visit_prediction == 1){
+     probability_of_actualoutcome000 <- prob00 * prob00 * prob01
+    probability_of_actualoutcome001 <- prob00 * prob00 * prob11 
+    probability_of_actualoutcome011 <- prob00 * prob10 * prob11 
+    probability_of_actualoutcome110 <- prob10 * prob10 * prob01
+    
+    probability_of_actualoutcome010 <- prob00 * prob10 * prob01
+    probability_of_actualoutcome100 <- prob10 * prob00 * prob01
+    probability_of_actualoutcome101 <- prob10 * prob00 * prob11 
+    probability_of_actualoutcome111 <- prob10 * prob10 * prob11 
+    
+    for (email in set_of_three$email_segment){
+      if (email == "Womens E-Mail"){
+      
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33*(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email) + probability_of_actualoutcome100 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (1) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+      }
+      else if (email == "Mens E-Mail"){
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 *(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (-1* cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (1) + probability_of_actualoutcome101 * (1) + probability_of_actualoutcome111 * (1))
+      }
+      else{
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+      
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(1) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+        
+      }}
+  }
+    else{
+      probability_of_actualoutcome000 <- prob00 * prob00 * prob00
+    probability_of_actualoutcome001 <- prob00 * prob00 * prob10 
+    probability_of_actualoutcome011 <- prob00 * prob10 * prob10 
+    probability_of_actualoutcome110 <- prob10 * prob10 * prob00
+    
+    probability_of_actualoutcome010 <- prob00 * prob10 * prob00
+    probability_of_actualoutcome100 <- prob10 * prob00 * prob00
+    probability_of_actualoutcome101 <- prob10 * prob00 * prob10 
+    probability_of_actualoutcome111 <- prob10 * prob10 * prob10 
+    
+    for (email in set_of_three$email_segment){
+      if (email == "Womens E-Mail"){
+      
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33*(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction-cost_of_sending_1_email) + probability_of_actualoutcome100 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome110 * (Base_case_Womens_spend_prediction)  + probability_of_actualoutcome010 * (Base_case_Womens_spend_prediction) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_Womens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33*(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (1) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+      }
+      else if (email == "Mens E-Mail"){
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 *(probability_of_actualoutcome000*(-1*cost_of_sending_1_email) + probability_of_actualoutcome001*(-1*cost_of_sending_1_email) + probability_of_actualoutcome011 * (-1* cost_of_sending_1_email) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction-cost_of_sending_1_email)  + probability_of_actualoutcome010 * (-1*cost_of_sending_1_email) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction-1*cost_of_sending_1_email) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction - cost_of_sending_1_email))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (Base_case_mens_spend_prediction)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome101 * (Base_case_mens_spend_prediction) + probability_of_actualoutcome111 * (Base_case_mens_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 *(probability_of_actualoutcome000*(0) + probability_of_actualoutcome001*(0) + probability_of_actualoutcome011 * (0) + probability_of_actualoutcome110 * (1)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (1) + probability_of_actualoutcome101 * (1) + probability_of_actualoutcome111 * (1))
+        
+      }
+      else{
+        sum_of_profit_before_deployment <- sum_of_profit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+        
+        sum_of_revenue_before_deployment <- sum_of_revenue_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(Base_case_No_Email_spend_prediction) + probability_of_actualoutcome011 * (Base_case_No_Email_spend_prediction) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (Base_case_No_Email_spend_prediction))
+        
+        sum_of_expected_visit_before_deployment <- sum_of_expected_visit_before_deployment + 0.33 * (probability_of_actualoutcome000*0 + probability_of_actualoutcome001*(1) + probability_of_actualoutcome011 * (1) + probability_of_actualoutcome110 * (0)  + probability_of_actualoutcome010 * (0) + probability_of_actualoutcome100 * (0) + probability_of_actualoutcome101 * (0) + probability_of_actualoutcome111 * (1))
+      
+      }}
+      
+    }
+    
+      
+    
+    
+    expected_profit_from_the_companys_old_model <- append(expected_profit_from_the_companys_old_model, sum_of_profit_before_deployment)
+    
+    expected_revenue_from_the_companys_old_model <- append(expected_revenue_from_the_companys_old_model, sum_of_revenue_before_deployment)
+    
+    expected_visit_from_the_companys_old_model <- append(expected_visit_from_the_companys_old_model, sum_of_expected_visit_before_deployment)
+  
+}
+  
+
+
+#Expected profit from existing Email marketing System of Universal plus
+sum(expected_profit_from_the_companys_old_model)
+
+#expected revenue from existing Email marketing System of Universal plus
+sum(expected_revenue_from_the_companys_old_model)
+
+
+```
+
